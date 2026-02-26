@@ -1,0 +1,5 @@
+{
+  "name": "ShellDeck",
+  "description": "A modern, minimalist SSH workspace for Linux.",
+  "requestFramePermissions": []
+}
