@@ -17,3 +17,9 @@ repo/
 .pytest_cache/
 .idea/
 .vscode/
+.flathub-test/
+
+.flatpak-builder/
+
+__pycache__/
+*.pyc

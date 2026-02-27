@@ -1,751 +1,1103 @@
 #!/usr/bin/env python3
 
+"""Flathub preflight + linter runner.
+
+Typical usage:
+  python3 tools/flathub_tester.py
+  python3 tools/flathub_tester.py --strict --check-clean
+  python3 tools/flathub_tester.py --build
+  python3 tools/flathub_tester.py --export-submission /tmp/shelldeck-flathub-pr
+"""
+
+from __future__ import annotations
+
 import argparse
-from dataclasses import dataclass, asdict
-from pathlib import Path
-import subprocess
-import tempfile
-import shutil
 import json
+from pathlib import Path
 import re
+import shutil
+import subprocess
 import sys
-import os
+from typing import Any
+from urllib import error as urlerror
+from urllib import parse as urlparse
+from urllib import request as urlrequest
+import xml.etree.ElementTree as ET
 
 
 EXIT_OK = 0
-EXIT_HARD_FAIL = 1
-EXIT_MISSING_BINARY = 2
-EXIT_BROKEN_ENV = 3
-EXIT_BUNDLE_IMPORT_FAIL = 4
+EXIT_ERRORS = 2
+EXIT_TOOLING = 3
 
-WALK_SKIP_DIRS = {
-    ".git",
-    ".venv",
-    ".flatpak-builder",
-    "build",
-    "builddir",
-    "build-dir",
-    "dist",
-    "repo",
+KNOWN_APP_ID = "io.github.zyragames.shelldeck"
+ALLOWED_FLATHUB_JSON_KEYS = {
+    "only-arches",
+    "skip-arches",
+    "end-of-life",
+    "end-of-life-rebase",
+    "end-of-life-rebase-old-id",
+}
+ALLOWED_ARCHES = {"x86_64", "aarch64"}
+LINTER_HINTS = {
+    "finish-args-has-socket-ssh-auth": [
+        "Remove `--socket=ssh-auth` from `finish-args`.",
+        "Use Portals and app-private storage for key material.",
+    ],
+    "finish-args-ssh-filesystem-access": [
+        "Remove `--filesystem=~/.ssh*` from `finish-args`.",
+        "Use FileChooser Portal plus app-private storage.",
+    ],
+    "appid-url-not-reachable": [
+        "Check App-ID and verification-domain alignment.",
+        "For `io.github.*`, verify login-provider identity and URL ownership.",
+        "Check homepage/bugtracker URLs for redirects or dead links.",
+    ],
 }
 
 
-@dataclass
-class CheckResult:
-    name: str
-    status: str
-    hard: bool = False
-    soft: bool = False
-    warning: bool = False
-    returncode: int | None = None
-    stdout: str = ""
-    stderr: str = ""
-    details: str = ""
-    broken_exit_code: int | None = None
+class Reporter:
+    def __init__(self) -> None:
+        self.items: list[dict[str, Any]] = []
+        self.counts = {"ERROR": 0, "WARN": 0, "OK": 0}
+
+    def add(
+        self,
+        section: str,
+        level: str,
+        message: str,
+        details: str = "",
+        hints: list[str] | None = None,
+    ) -> None:
+        self.items.append(
+            {
+                "section": section,
+                "level": level,
+                "message": message,
+                "details": details.strip(),
+                "hints": hints or [],
+            }
+        )
+        self.counts[level] += 1
+
+    def ok(self, section: str, message: str, details: str = "") -> None:
+        self.add(section, "OK", message, details)
+
+    def warn(
+        self, section: str, message: str, details: str = "", hints: list[str] | None = None
+    ) -> None:
+        self.add(section, "WARN", message, details, hints)
+
+    def error(
+        self, section: str, message: str, details: str = "", hints: list[str] | None = None
+    ) -> None:
+        self.add(section, "ERROR", message, details, hints)
+
+    def print(self) -> None:
+        by_section: dict[str, list[dict[str, Any]]] = {}
+        for item in self.items:
+            by_section.setdefault(item["section"], []).append(item)
+
+        for section in by_section:
+            print(f"\n== {section} ==")
+            for item in by_section[section]:
+                print(f"[{item['level']}] {item['message']}")
+                if item["details"]:
+                    for line in item["details"].splitlines():
+                        print(f"  {line}")
+                if item["hints"]:
+                    print("  Fix hints:")
+                    for hint in item["hints"]:
+                        print(f"   - {hint}")
 
 
-def run_cmd(args, cwd=None):
+def run_cmd(args: list[str], check: bool = False, cwd: Path | None = None) -> tuple[int, str, str]:
     proc = subprocess.run(
         args,
         cwd=str(cwd) if cwd else None,
         text=True,
         capture_output=True,
     )
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(args)}\n{proc.stderr}")
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def print_result(result):
-    tag = result.status
-    print(f"[{tag}] {result.name}")
-    if result.details:
-        print(f"  {result.details}")
-    if result.status == "FAIL":
-        if result.returncode is not None:
-            print(f"  returncode: {result.returncode}")
-        out = result.stdout.strip()
-        err = result.stderr.strip()
-        if out:
-            print("  stdout:")
-            for line in out.splitlines():
-                print(f"    {line}")
-        if err:
-            print("  stderr:")
-            for line in err.splitlines():
-                print(f"    {line}")
+def detect_tooling() -> dict[str, Any]:
+    flatpak = shutil.which("flatpak")
+    host_builder = shutil.which("flatpak-builder")
+    host_lint = shutil.which("flatpak-builder-lint")
+    host_flathub_build = shutil.which("flathub-build")
+    runtime_builder = False
+    if flatpak:
+        rc, _, _ = run_cmd(["flatpak", "info", "org.flatpak.Builder"])
+        runtime_builder = rc == 0
+
+    return {
+        "flatpak": bool(flatpak),
+        "runtime_builder": runtime_builder,
+        "host_builder": bool(host_builder),
+        "host_lint": bool(host_lint),
+        "host_flathub_build": bool(host_flathub_build),
+    }
 
 
-def to_jsonable(result):
-    data = asdict(result)
-    return data
-
-
-def detect_manifest(repo_root: Path):
-    candidates = []
-    for pattern in ("*.yml", "*.yaml", "*.json"):
-        candidates.extend(repo_root.glob(pattern))
-
-    flatpak_dir = repo_root / "flatpak"
-    if flatpak_dir.exists() and flatpak_dir.is_dir():
-        for pattern in ("*.yml", "*.yaml", "*.json"):
-            candidates.extend(flatpak_dir.glob(pattern))
-    candidates = sorted({p.resolve() for p in candidates})
-
-    if len(candidates) == 1:
-        return candidates[0], None
-    if len(candidates) == 0:
-        return (
-            None,
-            "Kein Manifest gefunden unter ./*.yml|*.yaml|*.json oder flatpak/*.yml|*.yaml|*.json. Bitte --manifest setzen.",
-        )
-
-    listed = "\n".join(f"- {p}" for p in candidates)
-    return None, f"Mehrere Manifeste gefunden. Bitte --manifest setzen:\n{listed}"
-
-
-def resolve_path(value: str, repo_root: Path):
-    p = Path(value)
-    if p.is_absolute():
-        return p
-    candidate = (repo_root / p).resolve()
-    if candidate.exists():
-        return candidate
-    return p.resolve()
-
-
-def extract_app_id(manifest_path: Path):
-    try:
-        text = manifest_path.read_text(encoding="utf-8", errors="ignore")
-    except OSError:
-        return None
-
-    patterns = [
-        r'^\s*(?:"?app-id"?)\s*:\s*["\']?([A-Za-z0-9._-]+)',
-        r'^\s*(?:"?id"?)\s*:\s*["\']?([A-Za-z0-9._-]+)',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, text, flags=re.MULTILINE)
-        if match:
-            return match.group(1)
+def builder_show_manifest_cmd(tooling: dict[str, Any]) -> list[str] | None:
+    if tooling["flatpak"] and tooling["runtime_builder"]:
+        return [
+            "flatpak",
+            "run",
+            "--command=flatpak-builder",
+            "org.flatpak.Builder",
+            "--show-manifest",
+        ]
+    if tooling["host_builder"]:
+        return ["flatpak-builder", "--show-manifest"]
     return None
 
 
-def find_metainfo(repo_root: Path, app_id: str | None):
-    all_meta = []
-    all_meta.extend(repo_root.rglob("*.metainfo.xml"))
-    all_meta.extend(repo_root.rglob("*.appdata.xml"))
-    all_meta = sorted({p.resolve() for p in all_meta if p.is_file()})
-
-    if not all_meta:
-        return None
-
-    if app_id:
-        pref_names = {f"{app_id}.metainfo.xml", f"{app_id}.appdata.xml"}
-        preferred = [p for p in all_meta if p.name in pref_names]
-        if preferred:
-            return sorted(preferred)[0]
-
-    return all_meta[0]
-
-
-def is_skipped_path(path: Path):
-    return any(part in WALK_SKIP_DIRS for part in path.parts)
-
-
-def check_flatpak_binary():
-    if shutil.which("flatpak"):
-        return CheckResult(name="flatpak binary vorhanden", status="OK")
-    return CheckResult(
-        name="flatpak binary vorhanden",
-        status="FAIL",
-        hard=True,
-        details="'flatpak' wurde nicht gefunden. Bitte Flatpak installieren.",
-        broken_exit_code=EXIT_MISSING_BINARY,
-    )
-
-
-def check_builder_installed():
-    rc, out, err = run_cmd(["flatpak", "info", "org.flatpak.Builder"])
-    if rc == 0:
-        return CheckResult(
-            name="org.flatpak.Builder installiert", status="OK", stdout=out, stderr=err
-        )
-
-    fix = (
-        "Fix:\n"
-        "flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo\n"
-        "flatpak install -y flathub org.flatpak.Builder"
-    )
-    return CheckResult(
-        name="org.flatpak.Builder installiert",
-        status="FAIL",
-        hard=True,
-        returncode=rc,
-        stdout=out,
-        stderr=err,
-        details=fix,
-    )
-
-
-def check_manifest_lint(manifest_path: Path):
-    rc, out, err = run_cmd(
-        [
+def lint_cmd(tooling: dict[str, Any], kind: str, target: Path) -> list[str] | None:
+    if tooling["flatpak"] and tooling["runtime_builder"]:
+        return [
             "flatpak",
             "run",
             "--command=flatpak-builder-lint",
             "org.flatpak.Builder",
-            "manifest",
+            kind,
+            str(target),
+        ]
+    if tooling["host_lint"]:
+        return ["flatpak-builder-lint", kind, str(target)]
+    return None
+
+
+def flathub_build_cmd(
+    tooling: dict[str, Any], repo_path: Path, manifest_path: Path
+) -> list[str] | None:
+    if tooling["flatpak"] and tooling["runtime_builder"]:
+        return [
+            "flatpak",
+            "run",
+            "--command=flathub-build",
+            "org.flatpak.Builder",
+            f"--repo={repo_path}",
             str(manifest_path),
         ]
+    if tooling["host_flathub_build"]:
+        return ["flathub-build", f"--repo={repo_path}", str(manifest_path)]
+    return None
+
+
+def resolve_manifest_to_json(manifest_path: Path, tooling: dict[str, Any]) -> dict[str, Any]:
+    base_cmd = builder_show_manifest_cmd(tooling)
+    if not base_cmd:
+        raise RuntimeError(
+            "Neither org.flatpak.Builder nor host flatpak-builder available for --show-manifest"
+        )
+    rc, out, err = run_cmd(base_cmd + [str(manifest_path)])
+    if rc != 0:
+        raise RuntimeError(f"show-manifest failed for {manifest_path}\n{err.strip()}")
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"show-manifest output is not valid JSON: {exc}") from exc
+
+
+def extract_linter_ids(text: str) -> list[str]:
+    ids = sorted(set(re.findall(r"\b([a-z0-9]+(?:-[a-z0-9]+)+)\b", text)))
+    return [item for item in ids if item.count("-") >= 2]
+
+
+def compact_output(stdout: str, stderr: str, max_lines: int = 12) -> str:
+    lines = []
+    for part in (stdout.strip(), stderr.strip()):
+        if part:
+            lines.extend(part.splitlines())
+    if not lines:
+        return ""
+    if len(lines) <= max_lines:
+        return "\n".join(lines)
+    return "\n".join(lines[:max_lines] + [f"... ({len(lines) - max_lines} more lines)"])
+
+
+def detect_manifest(
+    repo_root: Path, tooling: dict[str, Any], preferred_appid: str | None
+) -> tuple[Path | None, str | None]:
+    root_candidates = sorted(
+        [p for ext in ("*.yml", "*.yaml", "*.json") for p in repo_root.glob(ext) if p.is_file()]
     )
-    if rc == 0:
-        return CheckResult(
-            name=f"Manifest lint ({manifest_path})",
-            status="OK",
-            returncode=rc,
-            stdout=out,
-            stderr=err,
-        )
-    return CheckResult(
-        name=f"Manifest lint ({manifest_path})",
-        status="FAIL",
-        hard=True,
-        returncode=rc,
-        stdout=out,
-        stderr=err,
-    )
+    if preferred_appid:
+        for suffix in (".yml", ".yaml", ".json"):
+            preferred = repo_root / f"{preferred_appid}{suffix}"
+            if preferred.exists():
+                return preferred.resolve(), None
+
+    valid: list[Path] = []
+    problems: list[str] = []
+    for candidate in root_candidates:
+        try:
+            resolved = resolve_manifest_to_json(candidate, tooling)
+            if isinstance(resolved, dict) and resolved.get("app-id"):
+                valid.append(candidate.resolve())
+        except RuntimeError as exc:
+            problems.append(f"{candidate.name}: {exc}")
+
+    if len(valid) == 1:
+        return valid[0], None
+    if len(valid) == 0:
+        if not root_candidates:
+            return None, "No manifest found in repo root (*.yml/*.yaml/*.json)."
+        if problems:
+            return None, "No root manifest could be resolved via --show-manifest."
+        return None, "No root manifest with `app-id` found."
+    listed = "\n".join(f"- {p}" for p in valid)
+    return None, f"Multiple valid root manifests found; pass --manifest.\n{listed}"
 
 
-def check_appstream_lint(metainfo_path: Path):
-    rc, out, err = run_cmd(
-        [
-            "flatpak",
-            "run",
-            "--command=flatpak-builder-lint",
-            "org.flatpak.Builder",
-            "appstream",
-            str(metainfo_path),
-        ]
-    )
-    if rc == 0:
-        return CheckResult(
-            name=f"AppStream lint ({metainfo_path})",
-            status="OK",
-            returncode=rc,
-            stdout=out,
-            stderr=err,
-        )
-    return CheckResult(
-        name=f"AppStream lint ({metainfo_path})",
-        status="FAIL",
-        hard=True,
-        returncode=rc,
-        stdout=out,
-        stderr=err,
-    )
-
-
-def check_repo_lint(repo_path: Path, label: str = "Repo lint"):
-    rc, out, err = run_cmd(
-        [
-            "flatpak",
-            "run",
-            "--command=flatpak-builder-lint",
-            "org.flatpak.Builder",
-            "repo",
-            str(repo_path),
-        ]
-    )
-    if rc == 0:
-        return CheckResult(
-            name=f"{label} ({repo_path})", status="OK", returncode=rc, stdout=out, stderr=err
-        )
-    return CheckResult(
-        name=f"{label} ({repo_path})",
-        status="FAIL",
-        hard=True,
-        returncode=rc,
-        stdout=out,
-        stderr=err,
-    )
-
-
-def check_bundle_lint(bundle_path: Path):
-    if not shutil.which("ostree"):
-        return [
-            CheckResult(
-                name="ostree binary vorhanden (Bundle-Checks)",
-                status="FAIL",
-                hard=True,
-                details="'ostree' wurde nicht gefunden, Bundle-Checks sind nicht moeglich.",
-                broken_exit_code=EXIT_MISSING_BINARY,
-            )
-        ]
-
-    results = []
-    with tempfile.TemporaryDirectory(prefix="flathub_tester_") as td:
-        temp_repo = Path(td) / "repo"
-
-        rc_init, out_init, err_init = run_cmd(
-            ["ostree", f"--repo={temp_repo}", "init", "--mode=bare-user"]
-        )
-        if rc_init != 0:
-            results.append(
-                CheckResult(
-                    name="Temp OSTree Repo init",
-                    status="FAIL",
-                    hard=True,
-                    returncode=rc_init,
-                    stdout=out_init,
-                    stderr=err_init,
-                    broken_exit_code=EXIT_BROKEN_ENV,
-                )
-            )
-            return results
-
-        results.append(
-            CheckResult(
-                name="Temp OSTree Repo init",
-                status="OK",
-                returncode=rc_init,
-                stdout=out_init,
-                stderr=err_init,
-            )
-        )
-
-        rc_imp, out_imp, err_imp = run_cmd(
-            [
-                "flatpak",
-                "build-import-bundle",
-                str(temp_repo),
-                str(bundle_path),
-                "--update-appstream",
-            ]
-        )
-        if rc_imp != 0:
-            results.append(
-                CheckResult(
-                    name=f"Bundle import ({bundle_path})",
-                    status="FAIL",
-                    hard=True,
-                    returncode=rc_imp,
-                    stdout=out_imp,
-                    stderr=err_imp,
-                    broken_exit_code=EXIT_BUNDLE_IMPORT_FAIL,
-                )
-            )
-            return results
-
-        results.append(
-            CheckResult(
-                name=f"Bundle import ({bundle_path})",
-                status="OK",
-                returncode=rc_imp,
-                stdout=out_imp,
-                stderr=err_imp,
-            )
-        )
-
-        rc_upd, out_upd, err_upd = run_cmd(["flatpak", "build-update-repo", str(temp_repo)])
-        if rc_upd == 0:
-            results.append(
-                CheckResult(
-                    name="build-update-repo (temp)",
-                    status="OK",
-                    returncode=rc_upd,
-                    stdout=out_upd,
-                    stderr=err_upd,
-                )
-            )
-        else:
-            results.append(
-                CheckResult(
-                    name="build-update-repo (temp)",
-                    status="WARN",
-                    warning=True,
-                    returncode=rc_upd,
-                    stdout=out_upd,
-                    stderr=err_upd,
-                    details="Warn-only: build-update-repo ist fehlgeschlagen, repo lint wird trotzdem ausgefuehrt.",
-                )
-            )
-
-        results.append(check_repo_lint(temp_repo, label="Bundle Repo lint"))
-    return results
-
-
-def check_desktop_files(repo_root: Path, app_id: str | None):
-    if not shutil.which("desktop-file-validate"):
-        return CheckResult(
-            name="Desktop-Dateien validieren",
-            status="WARN",
-            warning=True,
-            details="desktop-file-validate nicht gefunden (optional, kein Fail).",
-        )
-
-    all_desktops = sorted(
-        [
-            p.resolve()
-            for p in repo_root.rglob("*.desktop")
-            if p.is_file() and not is_skipped_path(p.relative_to(repo_root))
-        ]
-    )
-    if not all_desktops:
-        return CheckResult(
-            name="Desktop-Dateien validieren",
-            status="WARN",
-            warning=True,
-            details="Keine .desktop-Dateien gefunden.",
-        )
-
-    selected = all_desktops
+def find_metainfo(repo_root: Path, app_id: str | None) -> Path | None:
     if app_id:
-        preferred = [p for p in all_desktops if p.name == f"{app_id}.desktop"]
+        patterns = [
+            f"data/**/{app_id}.metainfo.xml",
+            f"**/share/metainfo/{app_id}.metainfo.xml",
+            f"**/{app_id}.metainfo.xml",
+        ]
+        for pattern in patterns:
+            found = sorted(repo_root.glob(pattern))
+            if found:
+                return found[0].resolve()
+    fallback = sorted(repo_root.glob("**/*.metainfo.xml"))
+    if fallback:
+        return fallback[0].resolve()
+    return None
+
+
+def find_desktop_and_icon(repo_root: Path, app_id: str | None) -> tuple[Path | None, Path | None]:
+    desktops = sorted(repo_root.glob("**/*.desktop"))
+    icon_candidates = sorted(repo_root.glob("**/*.svg")) + sorted(repo_root.glob("**/*.png"))
+
+    desktop = None
+    if app_id:
+        preferred = [p for p in desktops if p.name == f"{app_id}.desktop"]
         if preferred:
-            selected = preferred
+            desktop = preferred[0].resolve()
+    if not desktop and desktops:
+        desktop = desktops[0].resolve()
 
-    rc_total = 0
-    out_parts = []
-    err_parts = []
-    for desktop in selected:
-        rc, out, err = run_cmd(["desktop-file-validate", str(desktop)])
-        rc_total = max(rc_total, rc)
-        if out.strip():
-            out_parts.append(f"[{desktop}]\n{out.strip()}")
-        if err.strip():
-            err_parts.append(f"[{desktop}]\n{err.strip()}")
+    icon = None
+    if app_id:
+        preferred_icon = [
+            p for p in icon_candidates if p.stem == app_id or p.name.startswith(app_id + ".")
+        ]
+        if preferred_icon:
+            icon = preferred_icon[0].resolve()
+    if not icon and icon_candidates:
+        icon = icon_candidates[0].resolve()
+    return desktop, icon
 
-    if rc_total == 0:
-        return CheckResult(
-            name=f"Desktop-Dateien validieren ({len(selected)} Datei(en))",
-            status="OK",
-            returncode=0,
+
+def ensure_line_in_file(file_path: Path, line: str) -> bool:
+    existing = ""
+    if file_path.exists():
+        existing = file_path.read_text(encoding="utf-8", errors="ignore")
+    lines = [item.strip() for item in existing.splitlines()]
+    if line.strip() in lines:
+        return False
+    if existing and not existing.endswith("\n"):
+        existing += "\n"
+    file_path.write_text(existing + f"{line}\n", encoding="utf-8")
+    return True
+
+
+def relative_posix(path: Path, base: Path) -> str:
+    try:
+        return path.resolve().relative_to(base.resolve()).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def lint_with_builder(
+    kind: str, target: Path, tooling: dict[str, Any], reporter: Reporter, section: str
+) -> bool:
+    cmd = lint_cmd(tooling, kind, target)
+    if not cmd:
+        reporter.error(
+            section,
+            f"`flatpak-builder-lint {kind}` unavailable",
+            "Missing org.flatpak.Builder or host flatpak-builder-lint.",
+        )
+        return False
+
+    rc, out, err = run_cmd(cmd)
+    if rc == 0:
+        reporter.ok(section, f"`flatpak-builder-lint {kind}` passed", str(target))
+        return True
+
+    merged = "\n".join([out, err]).strip()
+    lint_ids = extract_linter_ids(merged)
+    hints: list[str] = []
+    for lint_id in lint_ids:
+        hints.extend(LINTER_HINTS.get(lint_id, []))
+
+    detail = compact_output(out, err)
+    if lint_ids:
+        detail = (
+            f"IDs: {', '.join(lint_ids)}\n{detail}" if detail else f"IDs: {', '.join(lint_ids)}"
+        )
+    reporter.error(section, f"`flatpak-builder-lint {kind}` failed", detail, hints)
+    return False
+
+
+def flatten_modules(modules: list[Any]) -> list[dict[str, Any]]:
+    flat: list[dict[str, Any]] = []
+    for module in modules or []:
+        if isinstance(module, dict):
+            flat.append(module)
+            nested = module.get("modules")
+            if isinstance(nested, list):
+                flat.extend(flatten_modules(nested))
+    return flat
+
+
+def check_manifest_location_and_naming(
+    reporter: Reporter,
+    repo_root: Path,
+    manifest_path: Path,
+    app_id: str,
+    manifest_json: dict[str, Any],
+) -> None:
+    section = "Preflight: Manifest"
+    if manifest_path.parent.resolve() != repo_root.resolve():
+        reporter.error(
+            section,
+            "Manifest is not in repo root",
+            f"Found: {manifest_path}",
+            ["Move manifest to repository root."],
+        )
+    else:
+        reporter.ok(section, "Manifest is in repo root", str(manifest_path))
+
+    expected_names = {f"{app_id}.yml", f"{app_id}.yaml", f"{app_id}.json"}
+    if manifest_path.name not in expected_names:
+        reporter.error(
+            section,
+            "Manifest filename does not match app-id",
+            f"Expected one of: {', '.join(sorted(expected_names))}\nFound: {manifest_path.name}",
+            ["Rename manifest to `<app-id>.yml` and keep it at repo root."],
+        )
+    else:
+        reporter.ok(section, "Manifest filename matches app-id", manifest_path.name)
+
+    components = [item for item in app_id.split(".") if item]
+    if len(app_id) > 255:
+        reporter.error(section, "App-ID exceeds 255 chars", app_id)
+    elif not (3 <= len(components) <= 5):
+        reporter.error(section, "App-ID should have 3..5 components", app_id)
+    else:
+        reporter.ok(section, "App-ID shape looks valid", app_id)
+
+    runtime = manifest_json.get("runtime")
+    sdk = manifest_json.get("sdk")
+    if runtime:
+        reporter.ok(section, "Runtime set", str(runtime))
+    else:
+        reporter.warn(section, "Runtime missing", "Add `runtime` to manifest root.")
+    if sdk:
+        reporter.ok(section, "SDK set", str(sdk))
+    else:
+        reporter.warn(section, "SDK missing", "Add `sdk` to manifest root.")
+
+
+def check_permissions_and_offline_build(reporter: Reporter, manifest_json: dict[str, Any]) -> None:
+    section = "Preflight: Permissions"
+    finish_args = manifest_json.get("finish-args") or []
+    finish_args = [str(item) for item in finish_args if isinstance(item, str)]
+
+    hard_patterns = [
+        "--socket=ssh-auth",
+        "--socket=ssh-agent",
+        "--filesystem=~/.ssh",
+        "--filesystem=home",
+        "--filesystem=~",
+        "--filesystem=/home",
+    ]
+    warn_patterns = [
+        "--filesystem=host",
+        "--device=all",
+        "--talk-name=*",
+        "--system-bus",
+        "--filesystem=xdg-run/",
+    ]
+
+    for arg in finish_args:
+        if any(arg == pat or arg.startswith(pat) for pat in hard_patterns):
+            reporter.error(section, f"Disallowed static permission: {arg}")
+        elif any(arg == pat or arg.startswith(pat) for pat in warn_patterns):
+            reporter.warn(
+                section,
+                f"Broad static permission: {arg}",
+                "Minimize static permissions where possible.",
+            )
+
+    if not finish_args:
+        reporter.warn(
+            section, "No finish-args found", "Ensure sandbox permissions are explicitly reviewed."
+        )
+    else:
+        reporter.ok(section, "finish-args parsed", f"Count: {len(finish_args)}")
+
+    network_hits: list[str] = []
+
+    def probe_build_args(obj: dict[str, Any], label: str) -> None:
+        build_opts = obj.get("build-options") if isinstance(obj, dict) else None
+        if not isinstance(build_opts, dict):
+            return
+        build_args = build_opts.get("build-args")
+        if not isinstance(build_args, list):
+            return
+        for entry in build_args:
+            if isinstance(entry, str) and "--share=network" in entry:
+                network_hits.append(f"{label}: {entry}")
+
+    probe_build_args(manifest_json, "manifest")
+    for idx, module in enumerate(flatten_modules(manifest_json.get("modules") or [])):
+        mod_name = module.get("name") or f"module[{idx}]"
+        probe_build_args(module, str(mod_name))
+
+    if network_hits:
+        reporter.error(
+            section,
+            "Build args include `--share=network`",
+            "\n".join(network_hits),
+            ["Remove network sharing from build args; Flathub builds run offline."],
+        )
+    else:
+        reporter.ok(section, "No offline-build violations found")
+
+
+def source_url_private(url_value: str) -> bool:
+    parsed = urlparse.urlparse(url_value)
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    if host.endswith(".local") or host.endswith(".internal"):
+        return True
+    return False
+
+
+def check_sources(reporter: Reporter, manifest_json: dict[str, Any]) -> None:
+    section = "Preflight: Sources"
+    modules = flatten_modules(manifest_json.get("modules") or [])
+    if not modules:
+        reporter.warn(section, "No modules found in resolved manifest")
+        return
+
+    checks = 0
+    for idx, module in enumerate(modules):
+        mod_name = module.get("name") or f"module[{idx}]"
+        sources = module.get("sources") or []
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, dict):
+                continue
+            checks += 1
+            source_type = source.get("type")
+            url = source.get("url")
+            sha = source.get("sha256")
+
+            if source_type in {"archive", "file", "extra-data"} and url and not sha:
+                reporter.error(
+                    section, f"Missing sha256 for {source_type} source in {mod_name}", str(url)
+                )
+
+            if source_type == "git":
+                has_branch = bool(source.get("branch"))
+                has_commit_or_tag = bool(source.get("commit") or source.get("tag"))
+                if has_branch and not has_commit_or_tag:
+                    reporter.warn(
+                        section,
+                        f"Git source uses branch without commit/tag in {mod_name}",
+                        str(source.get("branch")),
+                    )
+
+            if isinstance(url, str) and source_url_private(url):
+                reporter.warn(section, f"Source URL looks private/local in {mod_name}", url)
+
+    reporter.ok(section, "Source scan complete", f"Checked {checks} source entries")
+
+
+def check_license_install_heuristic(reporter: Reporter, manifest_json: dict[str, Any]) -> None:
+    section = "Preflight: License install"
+    modules = flatten_modules(manifest_json.get("modules") or [])
+    interesting = [m for m in modules if isinstance(m.get("buildsystem"), str)]
+    if not interesting:
+        reporter.warn(section, "No buildsystem modules found for license heuristic")
+        return
+
+    hit = False
+    patterns = (
+        "/share/licenses/$FLATPAK_ID",
+        "${FLATPAK_DEST}/share/licenses/$FLATPAK_ID",
+    )
+    for module in interesting:
+        for key in ("install-commands", "build-commands"):
+            commands = module.get(key)
+            if not isinstance(commands, list):
+                continue
+            for cmd in commands:
+                if isinstance(cmd, str) and any(token in cmd for token in patterns):
+                    hit = True
+                    break
+            if hit:
+                break
+        if hit:
+            break
+
+    if hit:
+        reporter.ok(section, "License install command pattern detected")
+    else:
+        reporter.warn(
+            section,
+            "No obvious license install command detected",
+            "Heuristic only; install LICENSE/COPYING under `${FLATPAK_DEST}/share/licenses/$FLATPAK_ID/`.",
         )
 
-    return CheckResult(
-        name=f"Desktop-Dateien validieren ({len(selected)} Datei(en))",
-        status="FAIL",
-        soft=True,
-        returncode=rc_total,
-        stdout="\n\n".join(out_parts),
-        stderr="\n\n".join(err_parts),
-        details="Desktop-Validierung hat Fehler gemeldet (soft fail).",
-    )
+
+def check_repo_hygiene(reporter: Reporter, repo_root: Path) -> None:
+    section = "Preflight: Repo hygiene"
+    blocked = [repo_root / ".flatpak-builder", repo_root / "build", repo_root / "repo"]
+    found_blocked = [str(path) for path in blocked if path.exists()]
+    if found_blocked:
+        reporter.error(section, "Build artifacts found in repo", "\n".join(found_blocked))
+    else:
+        reporter.ok(section, "No top-level build artifacts found")
+
+    pycache_hits = [
+        str(p) for p in repo_root.glob("**/__pycache__") if p.is_dir() and ".git" not in p.parts
+    ]
+    pyc_hits = [str(p) for p in repo_root.glob("**/*.pyc") if p.is_file() and ".git" not in p.parts]
+    flatpak_hits = [
+        str(p) for p in repo_root.glob("**/*.flatpak") if p.is_file() and ".git" not in p.parts
+    ]
+
+    if pycache_hits or pyc_hits or flatpak_hits:
+        lines = []
+        lines.extend(pycache_hits[:20])
+        lines.extend(pyc_hits[:20])
+        lines.extend(flatpak_hits[:20])
+        reporter.warn(section, "Generated files present", "\n".join(lines))
+    else:
+        reporter.ok(section, "No obvious generated files detected")
 
 
-def check_repo_hygiene(repo_root: Path):
-    soft_fail_artifact_names = ["repo", "build", "builddir", "dist", "__pycache__"]
-    warn_artifact_names = [".flatpak-builder"]
+def check_git_clean(reporter: Reporter, repo_root: Path, workdir: Path) -> None:
+    section = "Preflight: Git clean"
+    rc, out, err = run_cmd(["git", "status", "--porcelain"], cwd=repo_root)
+    if rc != 0:
+        reporter.warn(section, "`git status --porcelain` failed", err.strip() or out.strip())
+        return
 
-    soft_fail_found = []
-    warn_found = []
-
-    for name in soft_fail_artifact_names:
-        if name != "__pycache__":
-            p = repo_root / name
-            if p.exists():
-                soft_fail_found.append(p.resolve())
-
-    for name in warn_artifact_names:
-        p = repo_root / name
-        if p.exists():
-            warn_found.append(p.resolve())
-
-    pycache_found = []
-    for root, dirs, _files in os.walk(repo_root):
-        root_path = Path(root)
-        rel_root = root_path.relative_to(repo_root)
-        dirs[:] = [d for d in dirs if d not in WALK_SKIP_DIRS]
-        if is_skipped_path(rel_root):
+    rel_workdir = relative_posix(workdir, repo_root).rstrip("/") + "/"
+    dirty: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4:
             continue
-        if root_path.name == "__pycache__":
-            pycache_found.append(root_path.resolve())
-    soft_fail_found.extend(pycache_found)
-
-    large_files = []
-    threshold = 50 * 1024 * 1024
-    for root, dirs, files in os.walk(repo_root):
-        root_path = Path(root)
-        rel_root = root_path.relative_to(repo_root)
-        dirs[:] = [d for d in dirs if d not in WALK_SKIP_DIRS]
-        if is_skipped_path(rel_root):
+        path_part = line[3:]
+        if " -> " in path_part:
+            path_part = path_part.split(" -> ", 1)[1]
+        path_part = path_part.strip()
+        if path_part.startswith(rel_workdir):
             continue
-        for filename in files:
-            fp = root_path / filename
+        dirty.append(line)
+
+    if dirty:
+        reporter.warn(section, "Working tree is not clean", "\n".join(dirty[:30]))
+    else:
+        reporter.ok(section, "Working tree clean (excluding tester workdir)")
+
+
+def check_metainfo(
+    reporter: Reporter, metainfo_path: Path | None, app_id: str, no_net: bool
+) -> None:
+    section = "Preflight: Metainfo"
+    if not metainfo_path:
+        reporter.error(section, "Metainfo file not found")
+        return
+
+    reporter.ok(section, "Metainfo detected", str(metainfo_path))
+    try:
+        tree = ET.parse(metainfo_path)
+        root = tree.getroot()
+    except ET.ParseError as exc:
+        reporter.error(section, "Metainfo XML parse failed", str(exc))
+        return
+
+    def text_of(path: str) -> str:
+        node = root.find(path)
+        if node is None or node.text is None:
+            return ""
+        return node.text.strip()
+
+    component_id = text_of("id")
+    if component_id != app_id:
+        reporter.error(
+            section,
+            "`<id>` does not match app-id",
+            f"metainfo: {component_id or '<missing>'}\nmanifest: {app_id}",
+        )
+    else:
+        reporter.ok(section, "`<id>` matches app-id")
+
+    required_simple = ["metadata_license", "project_license"]
+    for tag in required_simple:
+        value = text_of(tag)
+        if value:
+            reporter.ok(section, f"`<{tag}>` present", value)
+        else:
+            reporter.error(section, f"`<{tag}>` missing")
+
+    dev = root.find("developer")
+    dev_name = root.find("developer/name")
+    if (
+        dev is not None
+        and dev.attrib.get("id")
+        and dev_name is not None
+        and (dev_name.text or "").strip()
+    ):
+        reporter.ok(section, "`<developer id><name>` present")
+    else:
+        reporter.error(
+            section,
+            "Developer metadata missing",
+            'Need `<developer id="..."><name>...</name></developer>`',
+        )
+
+    launchable = None
+    for node in root.findall("launchable"):
+        if node.attrib.get("type") == "desktop-id":
+            launchable = (node.text or "").strip()
+            break
+    if launchable:
+        reporter.ok(section, "Desktop launchable present", launchable)
+    else:
+        reporter.error(section, 'Missing `<launchable type="desktop-id">`')
+
+    if no_net:
+        reporter.ok(section, "URL reachability checks skipped", "--no-net enabled")
+        return
+
+    for url_type in ("homepage", "bugtracker"):
+        node = root.find(f"url[@type='{url_type}']")
+        if node is None or not (node.text or "").strip():
+            reporter.warn(section, f'`<url type="{url_type}">` missing')
+            continue
+        url_value = (node.text or "").strip()
+        try:
+            req = urlrequest.Request(url_value, method="HEAD")
+            with urlrequest.urlopen(req, timeout=12) as response:
+                code = int(getattr(response, "status", 200))
+            if code >= 400:
+                reporter.error(
+                    section, f"{url_type} URL not reachable", f"{url_value} -> HTTP {code}"
+                )
+            else:
+                reporter.ok(section, f"{url_type} URL reachable", f"{url_value} -> HTTP {code}")
+        except Exception:
             try:
-                size = fp.stat().st_size
-            except OSError:
+                with urlrequest.urlopen(url_value, timeout=12) as response:
+                    code = int(getattr(response, "status", 200))
+                if code >= 400:
+                    reporter.error(
+                        section, f"{url_type} URL not reachable", f"{url_value} -> HTTP {code}"
+                    )
+                else:
+                    reporter.ok(section, f"{url_type} URL reachable", f"{url_value} -> HTTP {code}")
+            except (urlerror.URLError, urlerror.HTTPError, TimeoutError) as exc:
+                reporter.error(section, f"{url_type} URL not reachable", f"{url_value}\n{exc}")
+
+
+def check_flathub_json(reporter: Reporter, repo_root: Path) -> None:
+    section = "Preflight: flathub.json"
+    path = repo_root / "flathub.json"
+    if not path.exists():
+        reporter.warn(
+            section, "No flathub.json", "Optional; useful if only some arches are supported."
+        )
+        return
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        reporter.error(section, "Invalid flathub.json", str(exc))
+        return
+
+    if not isinstance(data, dict):
+        reporter.error(section, "flathub.json must be an object")
+        return
+
+    unknown = sorted(set(data.keys()) - ALLOWED_FLATHUB_JSON_KEYS)
+    if unknown:
+        reporter.warn(section, "Unknown flathub.json keys", ", ".join(unknown))
+    else:
+        reporter.ok(section, "flathub.json keys recognized")
+
+    if "only-arches" in data and "skip-arches" in data:
+        reporter.error(section, "`only-arches` and `skip-arches` cannot both be set")
+
+    for key in ("only-arches", "skip-arches"):
+        if key not in data:
+            continue
+        value = data[key]
+        if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+            reporter.error(section, f"`{key}` must be list[str]")
+            continue
+        invalid = [item for item in value if item not in ALLOWED_ARCHES]
+        if invalid:
+            reporter.error(section, f"`{key}` contains unsupported arches", ", ".join(invalid))
+        else:
+            reporter.ok(section, f"`{key}` arches look valid", ", ".join(value))
+
+
+def extract_dependency_manifest_refs(manifest_path: Path, repo_root: Path) -> list[Path]:
+    refs: list[Path] = []
+    suffix = manifest_path.suffix.lower()
+    text = manifest_path.read_text(encoding="utf-8", errors="ignore")
+    if suffix == ".json":
+        try:
+            data = json.loads(text)
+            modules = data.get("modules") if isinstance(data, dict) else None
+            if isinstance(modules, list):
+                for item in modules:
+                    if isinstance(item, str) and item.endswith((".json", ".yml", ".yaml")):
+                        refs.append((manifest_path.parent / item).resolve())
+            return refs
+        except Exception:
+            pass
+
+    for match in re.finditer(r"^\s*-\s*([\w./-]+\.(?:json|ya?ml))\s*$", text, flags=re.MULTILINE):
+        candidate = (manifest_path.parent / match.group(1)).resolve()
+        if candidate.exists() and candidate.is_file():
+            refs.append(candidate)
+    unique = []
+    seen: set[Path] = set()
+    for ref in refs:
+        if ref not in seen:
+            seen.add(ref)
+            unique.append(ref)
+    return unique
+
+
+def collect_local_patch_files(
+    manifest_json: dict[str, Any], repo_root: Path
+) -> tuple[list[Path], list[str]]:
+    patches: list[Path] = []
+    warnings: list[str] = []
+    modules = flatten_modules(manifest_json.get("modules") or [])
+    for module in modules:
+        sources = module.get("sources")
+        if not isinstance(sources, list):
+            continue
+        for source in sources:
+            if not isinstance(source, dict):
                 continue
-            if size >= threshold:
-                large_files.append((fp.resolve(), size))
+            if source.get("type") != "file":
+                continue
+            path_value = source.get("path")
+            if not isinstance(path_value, str):
+                continue
+            candidate = (repo_root / path_value).resolve()
+            if not candidate.exists() or not candidate.is_file():
+                continue
+            lower = candidate.name.lower()
+            if lower.endswith((".patch", ".diff")):
+                patches.append(candidate)
+            else:
+                warnings.append(f"Skipped non-patch file source: {candidate}")
+    unique = []
+    seen: set[Path] = set()
+    for item in patches:
+        if item not in seen:
+            seen.add(item)
+            unique.append(item)
+    return unique, warnings
 
-    details = []
-    status = "OK"
-    soft = False
-    warning = False
 
-    if soft_fail_found:
-        status = "FAIL"
-        soft = True
-        details.append("Build-Artefakte gefunden (soft fail):")
-        shown = 0
-        for p in sorted(soft_fail_found):
-            if shown >= 25:
-                break
-            details.append(f"- {p}")
-            shown += 1
-        remaining = len(soft_fail_found) - shown
-        if remaining > 0:
-            details.append(f"- ... und {remaining} weitere")
+def copy_relative(src: Path, repo_root: Path, dst_root: Path) -> bool:
+    try:
+        rel = src.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    dst = (dst_root / rel).resolve()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(src, dst)
+    return True
 
-    if warn_found:
-        if status == "OK":
-            status = "WARN"
-        warning = True
-        details.append("Builder-Cache gefunden (Warnung):")
-        for p in sorted(warn_found):
-            details.append(f"- {p}")
 
-    if large_files:
-        if status == "OK":
-            status = "WARN"
-        warning = True
-        details.append("Dateien >= 50 MiB gefunden (Warnung):")
-        for p, size in sorted(large_files, key=lambda x: str(x[0]))[:25]:
-            mib = size / (1024 * 1024)
-            details.append(f"- {p} ({mib:.1f} MiB)")
-        if len(large_files) > 25:
-            details.append(f"- ... und {len(large_files) - 25} weitere")
+def export_submission_bundle(
+    reporter: Reporter,
+    repo_root: Path,
+    manifest_path: Path,
+    manifest_json: dict[str, Any],
+    export_dir: Path,
+) -> None:
+    section = "Submission export"
+    if export_dir.exists():
+        shutil.rmtree(export_dir)
+    export_dir.mkdir(parents=True, exist_ok=True)
 
-    return CheckResult(
-        name="Repo Hygiene",
-        status=status,
-        soft=soft,
-        warning=warning,
-        details="\n".join(details),
+    copied: list[Path] = []
+    copy_relative(manifest_path, repo_root, export_dir)
+    copied.append(manifest_path)
+
+    flathub_json = repo_root / "flathub.json"
+    if flathub_json.exists():
+        if copy_relative(flathub_json, repo_root, export_dir):
+            copied.append(flathub_json)
+
+    visited: set[Path] = set()
+    queue: list[Path] = [manifest_path]
+    while queue:
+        current = queue.pop(0)
+        if current in visited:
+            continue
+        visited.add(current)
+        for dep in extract_dependency_manifest_refs(current, repo_root):
+            if not dep.exists() or not dep.is_file():
+                continue
+            if copy_relative(dep, repo_root, export_dir):
+                copied.append(dep)
+            queue.append(dep)
+
+    patch_files, patch_warnings = collect_local_patch_files(manifest_json, repo_root)
+    for patch in patch_files:
+        if copy_relative(patch, repo_root, export_dir):
+            copied.append(patch)
+    for warning in patch_warnings:
+        reporter.warn(section, warning)
+
+    reporter.ok(section, "Submission files exported", f"{len(copied)} files -> {export_dir}")
+    reporter.ok(
+        section,
+        "Ready for flathub/flathub new-pr",
+        "Commit exported directory contents to your new-pr branch.",
     )
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Flathub Requirements Tester fuer ShellDeck")
-    parser.add_argument("--repo-root", default=".", help="Pfad zum Repo-Root (default: .)")
-    parser.add_argument("--manifest", help="Pfad zum Flatpak-Manifest")
-    parser.add_argument("--repo", help="Pfad zu einem OSTree-Repo")
-    parser.add_argument("--bundle", help="Pfad zu einer .flatpak Bundle-Datei")
-    parser.add_argument("--json", action="store_true", help="JSON-Output fuer CI")
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Flathub submission preflight + lints")
+    parser.add_argument("--manifest", help="Path to Flatpak manifest")
+    parser.add_argument("--metainfo", help="Path to metainfo XML")
+    parser.add_argument(
+        "--workdir",
+        default=".flathub-test",
+        help="Workspace for build/repo artifacts (default: ./.flathub-test)",
+    )
+    parser.add_argument("--no-net", action="store_true", help="Skip URL reachability checks")
+    parser.add_argument("--strict", action="store_true", help="Treat WARN as ERROR for exit code")
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="Run flathub-build into workdir and lint generated repo",
+    )
+    parser.add_argument("--repo", help="Existing repo path to lint (default: <workdir>/repo)")
+    parser.add_argument("--export-submission", help="Export required submission files to directory")
+    parser.add_argument(
+        "--check-clean", action="store_true", help="Check git working tree cleanliness"
+    )
+    parser.add_argument(
+        "--fix-gitignore",
+        action="store_true",
+        help="Append common artifact patterns to .gitignore when missing",
+    )
     args = parser.parse_args()
 
-    repo_root = Path(args.repo_root).resolve()
-    if not repo_root.exists():
-        result = CheckResult(
-            name="Repo-Root existiert",
-            status="FAIL",
-            hard=True,
-            details=f"Repo-Root existiert nicht: {repo_root}",
-            broken_exit_code=EXIT_BROKEN_ENV,
+    repo_root = Path.cwd().resolve()
+    reporter = Reporter()
+
+    tooling = detect_tooling()
+    section = "Tooling"
+    if tooling["flatpak"]:
+        reporter.ok(section, "`flatpak` found")
+    else:
+        reporter.warn(
+            section, "`flatpak` not found", "Will fall back to host binaries where possible."
         )
-        if args.json:
-            payload = {
-                "repo_root": str(repo_root),
-                "results": [to_jsonable(result)],
-                "summary": {
-                    "hard_failures": 1,
-                    "soft_failures": 0,
-                    "warnings": 0,
-                    "broken_environment": True,
-                    "exit_code": EXIT_BROKEN_ENV,
-                },
-            }
-            print(json.dumps(payload, indent=2, ensure_ascii=True))
-        else:
-            print_result(result)
-        return EXIT_BROKEN_ENV
+    if tooling["runtime_builder"]:
+        reporter.ok(section, "`org.flatpak.Builder` runtime available")
+    else:
+        reporter.warn(section, "`org.flatpak.Builder` runtime unavailable")
+    if not (tooling["runtime_builder"] or tooling["host_builder"]):
+        reporter.error(
+            section,
+            "No manifest resolver available",
+            "Install org.flatpak.Builder or host `flatpak-builder`.",
+        )
+    if not (tooling["runtime_builder"] or tooling["host_lint"]):
+        reporter.error(
+            section,
+            "No linter available",
+            "Install org.flatpak.Builder or host `flatpak-builder-lint`.",
+        )
 
-    results = []
+    workdir = Path(args.workdir)
+    if not workdir.is_absolute():
+        workdir = (repo_root / workdir).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
 
-    flatpak_check = check_flatpak_binary()
-    results.append(flatpak_check)
+    workdir_line = relative_posix(workdir, repo_root).rstrip("/") + "/"
+    gitignore_path = repo_root / ".gitignore"
+    changed = ensure_line_in_file(gitignore_path, workdir_line)
+    if changed:
+        reporter.ok("Workspace", "Added workdir to .gitignore", workdir_line)
+    else:
+        reporter.ok("Workspace", "Workdir already ignored", workdir_line)
 
-    has_flatpak = flatpak_check.status == "OK"
-    builder_ok = False
+    if args.fix_gitignore:
+        for pattern in [
+            ".flatpak-builder/",
+            "build/",
+            "repo/",
+            "__pycache__/",
+            "*.pyc",
+            "*.flatpak",
+        ]:
+            ensure_line_in_file(gitignore_path, pattern)
+        reporter.ok("Workspace", "Applied --fix-gitignore patterns")
 
-    manifest_path = None
-    manifest_detect_issue = None
-
+    manifest_path: Path | None
     if args.manifest:
-        manifest_path = resolve_path(args.manifest, repo_root)
+        manifest_path = Path(args.manifest)
+        if not manifest_path.is_absolute():
+            manifest_path = (repo_root / manifest_path).resolve()
         if not manifest_path.exists():
-            results.append(
-                CheckResult(
-                    name="Manifest vorhanden",
-                    status="FAIL",
-                    hard=True,
-                    details=f"Manifest wurde nicht gefunden: {manifest_path}",
-                )
-            )
+            reporter.error("Discovery", "Manifest path does not exist", str(manifest_path))
             manifest_path = None
     else:
-        manifest_path, manifest_detect_issue = detect_manifest(repo_root)
+        manifest_path, issue = detect_manifest(repo_root, tooling, KNOWN_APP_ID)
+        if manifest_path:
+            reporter.ok("Discovery", "Manifest autodetected", str(manifest_path))
+        else:
+            reporter.error("Discovery", "Manifest autodetection failed", issue or "Unknown error")
 
-    app_id = extract_app_id(manifest_path) if manifest_path else None
+    if not manifest_path:
+        reporter.print()
+        print("\nSummary")
+        print(f"- ERROR: {reporter.counts['ERROR']}")
+        print(f"- WARN: {reporter.counts['WARN']}")
+        print(f"- OK: {reporter.counts['OK']}")
+        return EXIT_ERRORS
 
-    if has_flatpak:
-        builder_check = check_builder_installed()
-        results.append(builder_check)
-        builder_ok = builder_check.status == "OK"
+    app_id = ""
+    manifest_json: dict[str, Any] = {}
+    try:
+        manifest_json = resolve_manifest_to_json(manifest_path, tooling)
+        app_id = str(manifest_json.get("app-id") or manifest_json.get("id") or "")
+        if app_id:
+            reporter.ok("Discovery", "Resolved app-id from manifest", app_id)
+        else:
+            reporter.error("Discovery", "Resolved manifest missing app-id")
+    except RuntimeError as exc:
+        reporter.error("Discovery", "Unable to resolve manifest via --show-manifest", str(exc))
 
-    run_manifest_related = bool(manifest_path)
-    strict_manifest_required = not args.repo and not args.bundle
+    metainfo_path: Path | None = None
+    if args.metainfo:
+        metainfo_path = Path(args.metainfo)
+        if not metainfo_path.is_absolute():
+            metainfo_path = (repo_root / metainfo_path).resolve()
+        if not metainfo_path.exists():
+            reporter.error("Discovery", "Metainfo path does not exist", str(metainfo_path))
+            metainfo_path = None
+    elif app_id:
+        metainfo_path = find_metainfo(repo_root, app_id)
 
-    if not args.manifest and manifest_detect_issue:
-        if strict_manifest_required:
-            results.append(
-                CheckResult(
-                    name="Manifest Auto-Erkennung",
-                    status="FAIL",
-                    hard=True,
-                    details=manifest_detect_issue,
-                )
+    desktop_path, icon_path = find_desktop_and_icon(repo_root, app_id or None)
+    if desktop_path:
+        reporter.ok("Discovery", "Desktop file detected", str(desktop_path))
+    else:
+        reporter.warn("Discovery", "No desktop file detected")
+    if icon_path:
+        icon_note = str(icon_path)
+        if icon_path.suffix.lower() == ".png":
+            icon_note += " (PNG: verify >=256x256)"
+        reporter.ok("Discovery", "Icon candidate detected", icon_note)
+    else:
+        reporter.warn("Discovery", "No icon candidate detected")
+
+    if app_id:
+        check_manifest_location_and_naming(
+            reporter, repo_root, manifest_path, app_id, manifest_json
+        )
+        check_permissions_and_offline_build(reporter, manifest_json)
+        check_sources(reporter, manifest_json)
+        check_license_install_heuristic(reporter, manifest_json)
+        check_metainfo(reporter, metainfo_path, app_id, args.no_net)
+    check_flathub_json(reporter, repo_root)
+    check_repo_hygiene(reporter, repo_root)
+
+    if args.check_clean:
+        check_git_clean(reporter, repo_root, workdir)
+
+    lint_ok = True
+    lint_ok = lint_with_builder("manifest", manifest_path, tooling, reporter, "Linter") and lint_ok
+    if metainfo_path:
+        lint_ok = (
+            lint_with_builder("appstream", metainfo_path, tooling, reporter, "Linter") and lint_ok
+        )
+    else:
+        reporter.error("Linter", "Cannot run appstream lint", "Metainfo file not found.")
+        lint_ok = False
+
+    repo_to_lint = Path(args.repo).resolve() if args.repo else (workdir / "repo").resolve()
+    if args.build:
+        build_cmd = flathub_build_cmd(tooling, repo_to_lint, manifest_path)
+        if not build_cmd:
+            reporter.error(
+                "Build",
+                "flathub-build unavailable",
+                "Need org.flatpak.Builder or host flathub-build",
             )
         else:
-            results.append(
-                CheckResult(
-                    name="Manifest Auto-Erkennung",
-                    status="WARN",
-                    warning=True,
-                    details=f"{manifest_detect_issue} Manifest/AppStream-Checks werden uebersprungen.",
-                )
-            )
-
-    if run_manifest_related:
-        if has_flatpak and builder_ok:
-            results.append(check_manifest_lint(manifest_path))
-
-            metainfo_path = find_metainfo(repo_root, app_id)
-            if metainfo_path:
-                results.append(check_appstream_lint(metainfo_path))
+            repo_to_lint.parent.mkdir(parents=True, exist_ok=True)
+            rc, out, err = run_cmd(build_cmd, cwd=workdir)
+            if rc != 0:
+                reporter.error("Build", "flathub-build failed", compact_output(out, err))
             else:
-                results.append(
-                    CheckResult(
-                        name="AppStream lint",
-                        status="FAIL",
-                        hard=True,
-                        details="Keine .metainfo.xml/.appdata.xml gefunden.",
-                    )
-                )
-        elif has_flatpak and not builder_ok:
-            results.append(
-                CheckResult(
-                    name="Manifest/AppStream lint",
-                    status="SKIP",
-                    warning=True,
-                    details="Uebersprungen, weil org.flatpak.Builder fehlt.",
-                )
-            )
+                reporter.ok("Build", "flathub-build completed", str(repo_to_lint))
 
-    if args.repo:
-        repo_path = resolve_path(args.repo, repo_root)
-        if not repo_path.exists():
-            results.append(
-                CheckResult(
-                    name="Repo-Pfad vorhanden",
-                    status="FAIL",
-                    hard=True,
-                    details=f"Repo wurde nicht gefunden: {repo_path}",
-                )
-            )
-        elif has_flatpak and builder_ok:
-            results.append(check_repo_lint(repo_path))
-        elif has_flatpak and not builder_ok:
-            results.append(
-                CheckResult(
-                    name="Repo lint",
-                    status="SKIP",
-                    warning=True,
-                    details="Uebersprungen, weil org.flatpak.Builder fehlt.",
-                )
-            )
+    if repo_to_lint.exists():
+        lint_with_builder("repo", repo_to_lint, tooling, reporter, "Linter")
+    elif args.repo or args.build:
+        reporter.error("Linter", "Repo path for lint does not exist", str(repo_to_lint))
+    else:
+        reporter.warn(
+            "Linter", "Repo lint skipped", f"No repo at {repo_to_lint}. Use --build or --repo."
+        )
 
-    if args.bundle:
-        bundle_path = resolve_path(args.bundle, repo_root)
-        if not bundle_path.exists():
-            results.append(
-                CheckResult(
-                    name="Bundle-Pfad vorhanden",
-                    status="FAIL",
-                    hard=True,
-                    details=f"Bundle wurde nicht gefunden: {bundle_path}",
-                )
-            )
-        elif has_flatpak and builder_ok:
-            results.extend(check_bundle_lint(bundle_path))
-        elif has_flatpak and not builder_ok:
-            results.append(
-                CheckResult(
-                    name="Bundle lint",
-                    status="SKIP",
-                    warning=True,
-                    details="Uebersprungen, weil org.flatpak.Builder fehlt.",
-                )
-            )
+    if args.export_submission:
+        export_dir = Path(args.export_submission)
+        if not export_dir.is_absolute():
+            export_dir = (repo_root / export_dir).resolve()
+        export_submission_bundle(reporter, repo_root, manifest_path, manifest_json, export_dir)
 
-    if manifest_path:
-        results.append(check_desktop_files(repo_root, app_id))
-
-    results.append(check_repo_hygiene(repo_root))
-
-    hard_failures = 0
-    soft_failures = 0
-    warnings = 0
-    broken_code = None
-
-    for result in results:
-        if result.hard and result.status == "FAIL":
-            hard_failures += 1
-        if result.soft and result.status == "FAIL":
-            soft_failures += 1
-        if result.warning or result.status in ("WARN", "SKIP"):
-            warnings += 1
-        if result.broken_exit_code:
-            if broken_code is None:
-                broken_code = result.broken_exit_code
-            else:
-                broken_code = min(broken_code, result.broken_exit_code)
-
-    if args.json:
-        exit_code = EXIT_OK
-        if broken_code is not None:
-            exit_code = broken_code
-        elif hard_failures > 0:
-            exit_code = EXIT_HARD_FAIL
-
-        payload = {
-            "repo_root": str(repo_root),
-            "results": [to_jsonable(r) for r in results],
-            "summary": {
-                "hard_failures": hard_failures,
-                "soft_failures": soft_failures,
-                "warnings": warnings,
-                "broken_environment": broken_code is not None,
-                "exit_code": exit_code,
-            },
-        }
-        print(json.dumps(payload, indent=2, ensure_ascii=True))
-        return exit_code
-
-    for result in results:
-        print_result(result)
-
+    reporter.print()
     print("\nSummary")
-    print(f"- Harte Fehler: {hard_failures}")
-    print(f"- Nur Hygiene/Soft-Fails: {soft_failures}")
-    print(f"- Warnings/Skips: {warnings}")
+    print(f"- ERROR: {reporter.counts['ERROR']}")
+    print(f"- WARN: {reporter.counts['WARN']}")
+    print(f"- OK: {reporter.counts['OK']}")
 
-    if broken_code is not None:
-        print(f"- Broken environment erkannt (Exit-Code {broken_code})")
-        return broken_code
-
-    if hard_failures > 0:
-        return EXIT_HARD_FAIL
+    tooling_errors = any(
+        item["level"] == "ERROR" and item["section"] == "Tooling" for item in reporter.items
+    )
+    errors = reporter.counts["ERROR"]
+    warns = reporter.counts["WARN"]
+    if tooling_errors:
+        print(f"- Exit code: {EXIT_TOOLING}")
+        return EXIT_TOOLING
+    if errors > 0 or (args.strict and warns > 0):
+        print(f"- Exit code: {EXIT_ERRORS}")
+        return EXIT_ERRORS
+    print(f"- Exit code: {EXIT_OK}")
     return EXIT_OK
 
 
