@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=ShellDeck
+Comment=Organize SSH workspaces
+Exec=shelldeck
+Icon=shelldeck
+Terminal=false
+Type=Application
+Categories=Utility;Network;
