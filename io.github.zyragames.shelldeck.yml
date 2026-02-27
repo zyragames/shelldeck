@@ -1,0 +1,53 @@
+app-id: io.github.zyragames.shelldeck
+runtime: org.kde.Platform
+runtime-version: "6.10"
+sdk: org.kde.Sdk
+command: shelldeck
+base: io.qt.PySide.BaseApp
+base-version: "6.10"
+cleanup-commands:
+  - /app/cleanup-BaseApp.sh
+
+build-options:
+  env:
+    - BASEAPP_REMOVE_WEBENGINE=1
+    - BASEAPP_DISABLE_NUMPY=1
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+cleanup:
+  - "*.a"
+  - "*.la"
+  - /include
+  - /lib/pkgconfig
+  - /share/man
+modules:
+  - flatpak/python3-deps.json
+  - name: shelldeck
+    buildsystem: simple
+    build-commands:
+      - python3 -m pip install --no-build-isolation --no-deps --prefix=/app .
+      - install -Dm0644 flatpak/io.github.zyragames.shelldeck.desktop /app/share/applications/io.github.zyragames.shelldeck.desktop
+      - install -Dm0644 flatpak/io.github.zyragames.shelldeck.metainfo.xml /app/share/metainfo/io.github.zyragames.shelldeck.metainfo.xml
+      - install -Dm0644 packaging/icon.svg /app/share/icons/hicolor/scalable/apps/io.github.zyragames.shelldeck.svg
+    sources:
+      - type: dir
+        path: .
+        skip:
+          - .flatpak-builder
+          - .git
+          - .github
+          - .mypy_cache
+          - .pytest_cache
+          - .ruff_cache
+          - .venv
+          - _local
+          - build
+          - build-dir
+          - build_logs
+          - dist
+          - repo
+          - "**/__pycache__"

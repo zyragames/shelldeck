@@ -1,0 +1,4 @@
+QtPy==2.4.3
+qtawesome==1.4.1
+paramiko==3.5.1
+termqt==1.1

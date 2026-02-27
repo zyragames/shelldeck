@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ShellDeck
+Comment=Organize SSH workspaces
+Exec=shelldeck
+Icon=io.github.zyragames.shelldeck
+Terminal=false
+Categories=Network;Utility;
+Keywords=SSH;Terminal;Remote;Hosts;
+StartupNotify=true

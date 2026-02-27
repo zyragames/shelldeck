@@ -1,0 +1,217 @@
+{
+    "name": "python3-deps.json",
+    "buildsystem": "simple",
+    "build-commands": [],
+    "modules": [
+        {
+            "name": "python3-QtPy",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"QtPy==2.4.3\" --no-build-isolation"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/69/76/37c0ccd5ab968a6a438f9c623aeecc84c202ab2fabc6a8fd927580c15b5a/QtPy-2.4.3-py3-none-any.whl",
+                    "sha256": "72095afe13673e017946cc258b8d5da43314197b741ed2890e563cf384b51aa1",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "qtpy",
+                        "packagetype": "bdist_wheel"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "python3-qtawesome",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"qtawesome==1.4.1\" --no-build-isolation"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/69/76/37c0ccd5ab968a6a438f9c623aeecc84c202ab2fabc6a8fd927580c15b5a/QtPy-2.4.3-py3-none-any.whl",
+                    "sha256": "72095afe13673e017946cc258b8d5da43314197b741ed2890e563cf384b51aa1",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "qtpy",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/11/ef/b7c8c38d1717e2fcb777678ed11568b31062e34550e23297cc32e9e1105e/qtawesome-1.4.1-py3-none-any.whl",
+                    "sha256": "6a45f0ec214e0cd7c9c867772ec596799dcd5fae00a4b17717ff0d95d2e3fb64",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "qtawesome",
+                        "packagetype": "bdist_wheel"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "python3-paramiko",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"paramiko==3.5.1\" --no-build-isolation"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/3b/71/427945e6ead72ccffe77894b2655b695ccf14ae1866cd977e185d606dd2f/bcrypt-5.0.0-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+                    "sha256": "560ddb6ec730386e7b3b26b8b4c88197aaed924430e7b74666a586ac997249ef",
+                    "only-arches": [
+                        "x86_64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "bcrypt",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/45/b6/4c1205dde5e464ea3bd88e8742e19f899c16fa8916fb8510a851fae985b5/bcrypt-5.0.0-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+                    "sha256": "c2388ca94ffee269b6038d48747f4ce8df0ffbea43f31abfa18ac72f0218effb",
+                    "only-arches": [
+                        "aarch64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "bcrypt",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/98/df/0a1755e750013a2081e863e7cd37e0cdd02664372c754e5560099eb7aa44/cffi-2.0.0-cp313-cp313-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+                    "sha256": "c8d3b5532fc71b7a77c09192b4a5a200ea992702734a2e9279a37f2478236f26",
+                    "only-arches": [
+                        "x86_64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "cffi",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/a9/f5/a2c23eb03b61a0b8747f211eb716446c826ad66818ddc7810cc2cc19b3f2/cffi-2.0.0-cp313-cp313-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+                    "sha256": "d48a880098c96020b02d5a1f7d9251308510ce8858940e6fa99ece33f610838b",
+                    "only-arches": [
+                        "aarch64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "cffi",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/5c/32/9b87132a2f91ee7f5223b091dc963055503e9b442c98fc0b8a5ca765fab0/cryptography-46.0.5-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+                    "sha256": "039917b0dc418bb9f6edce8a906572d69e74bd330b0b3fea4f79dab7f8ddd235",
+                    "only-arches": [
+                        "x86_64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "cryptography",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/0f/04/c85bdeab78c8bc77b701bf0d9bdcf514c044e18a46dcff330df5448631b0/cryptography-46.0.5-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+                    "sha256": "7d1f30a86d2757199cb2d56e48cce14deddf1f9c95f1ef1b64ee91ea43fe2e18",
+                    "only-arches": [
+                        "aarch64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "cryptography",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/15/f8/c7bd0ef12954a81a1d3cea60a13946bd9a49a0036a5927770c461eade7ae/paramiko-3.5.1-py3-none-any.whl",
+                    "sha256": "43b9a0501fc2b5e70680388d9346cf252cfb7d00b0667c39e80eb43a408b8f61",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "paramiko",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/0c/c3/44f3fbbfa403ea2a7c779186dc20772604442dde72947e7d01069cbe98e3/pycparser-3.0-py3-none-any.whl",
+                    "sha256": "b727414169a36b7d524c1c3e31839a521725078d7b2ff038656844266160a992",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "pycparser",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/7f/81/d60984052df5c97b1d24365bc1e30024379b42c4edcd79d2436b1b9806f2/pynacl-1.6.2-cp38-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl",
+                    "sha256": "22de65bb9010a725b0dac248f353bb072969c94fa8d6b1f34b87d7953cf7bbe4",
+                    "only-arches": [
+                        "x86_64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "pynacl",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/1e/b4/e927e0653ba63b02a4ca5b4d852a8d1d678afbf69b3dbf9c4d0785ac905c/pynacl-1.6.2-cp38-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl",
+                    "sha256": "8845c0631c0be43abdd865511c41eab235e0be69c81dc66a50911594198679b0",
+                    "only-arches": [
+                        "aarch64"
+                    ],
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "pynacl",
+                        "packagetype": "bdist_wheel"
+                    }
+                }
+            ]
+        },
+        {
+            "name": "python3-termqt",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"termqt==1.1\" --no-build-isolation"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/69/76/37c0ccd5ab968a6a438f9c623aeecc84c202ab2fabc6a8fd927580c15b5a/QtPy-2.4.3-py3-none-any.whl",
+                    "sha256": "72095afe13673e017946cc258b8d5da43314197b741ed2890e563cf384b51aa1",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "qtpy",
+                        "packagetype": "bdist_wheel"
+                    }
+                },
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/8b/8e/23a40fcba01303cb356c010161c56c65ac692031d67d8121f2c32796faca/termqt-1.1-py3-none-any.whl",
+                    "sha256": "82c9582e83e6a9a291643c82afb6a433d15b933255633c1d903a49e40fbb29be",
+                    "x-checker-data": {
+                        "type": "pypi",
+                        "name": "termqt",
+                        "packagetype": "bdist_wheel"
+                    }
+                }
+            ]
+        }
+    ]
+}

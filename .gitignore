@@ -1,10 +1,14 @@
 __pycache__/
 *.pyc
+*.flatpak
 venv/
 .venv/
 _local/
 dist/
 build/
+build-dir/
+repo/
+.flatpak-builder/
 *.egg-info/
 *.log
 *.tmp

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.zyragames.shelldeck</id>
+  <name>ShellDeck</name>
+  <summary>Organize SSH workspaces</summary>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <developer id="io.github.zyragames">
+    <name>ShellDeck Contributors</name>
+  </developer>
+  <launchable type="desktop-id">io.github.zyragames.shelldeck.desktop</launchable>
+  <provides>
+    <binary>shelldeck</binary>
+  </provides>
+  <description>
+    <p>
+      ShellDeck helps you manage SSH hosts, launch terminal sessions, and keep server access
+      organized in a single desktop application.
+    </p>
+  </description>
+  <categories>
+    <category>Network</category>
+    <category>Utility</category>
+  </categories>
+  <keywords>
+    <keyword>SSH</keyword>
+    <keyword>terminal</keyword>
+    <keyword>remote</keyword>
+    <keyword>hosts</keyword>
+  </keywords>
+  <url type="homepage">https://github.com/zyragames/shelldeck</url>
+  <url type="bugtracker">https://github.com/zyragames/shelldeck/issues</url>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-02-27"/>
+  </releases>
+</component>
